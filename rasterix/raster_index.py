@@ -1,16 +1,62 @@
 import textwrap
-from collections.abc import Hashable, Mapping
-from typing import Any
+from collections.abc import Hashable, Iterable, Mapping, Sequence
+from typing import Any, Self
 
 import numpy as np
 import pandas as pd
 from affine import Affine
+from odc.geo import BoundingBox
+from odc.geo.geom import bbox_intersection, bbox_union
 from xarray import DataArray, Index, Variable
 from xarray.core.coordinate_transform import CoordinateTransform
 
 # TODO: import from public API once it is available
 from xarray.core.indexes import CoordinateTransformIndex, PandasIndex
 from xarray.core.indexing import IndexSelResult, merge_sel_results
+
+
+def _assert_transforms_are_compatible(A1: Affine, A2: Affine) -> None:
+    assert A1.a == A2.a
+    assert A1.b == A2.b
+    assert A1.d == A2.d
+    assert A1.e == A2.e
+
+
+def compute_bounding_box_affine(
+    A1: Affine, shape1: tuple[int, int], A2: Affine, shape2: tuple[int, int], *, how: str
+):
+    _assert_transforms_are_compatible(A1, A2)
+
+    # Apply both affine transformations to the corners
+    transformed1 = np.stack([A1 * point for point in [(0, 0), shape1]])
+    transformed2 = np.stack([A2 * point for point in [(0, 0), shape2]])
+
+    # Concatenate transformed points
+    all_points = np.stack([transformed1, transformed2])
+
+    # Compute bounding box min/max
+    if how == "outer":
+        min_x, min_y = all_points.min(axis=(0, 1)).tolist()
+        max_x, max_y = all_points.max(axis=(0, 1)).tolist()
+
+        assert max_x > min_x
+        assert max_y > min_y
+
+        # FIXME: floating point error here
+        Nx = None if A1.a == 0 else int(np.abs((max_x - min_x) / A1.a))
+        Ny = None if A1.e == 0 else int(np.abs((max_y - min_y) / A1.e))
+    else:
+        raise NotImplementedError
+
+    Anew = Affine(
+        A1.a,
+        A1.b,
+        min_x if A1.a > 0 else max_x,
+        A1.d,
+        A1.e,
+        min_y if A1.e > 0 else max_y,  # TODO: handle orientation here
+    )
+    return Anew, Nx, Ny
 
 
 class AffineTransform(CoordinateTransform):
@@ -282,6 +328,7 @@ class RasterIndex(Index):
     """
 
     _wrapped_indexes: dict[WrappedIndexCoords, WrappedIndex]
+    _shape: dict[str, int]
 
     def __init__(self, indexes: Mapping[WrappedIndexCoords, WrappedIndex]):
         idx_keys = list(indexes)
@@ -299,6 +346,13 @@ class RasterIndex(Index):
         assert axis_dependent ^ axis_independent
 
         self._wrapped_indexes = dict(indexes)
+        if axis_independent:
+            self._shape = {
+                "x": self._wrapped_indexes["x"].axis_transform.size,
+                "y": self._wrapped_indexes["y"].axis_transform.size,
+            }
+        else:
+            self._shape = next(iter(self._wrapped_indexes.values())).dim_size
 
     @classmethod
     def from_transform(
@@ -403,3 +457,125 @@ class RasterIndex(Index):
             items += [repr(coord_names) + ":", textwrap.indent(repr(index), "    ")]
 
         return "RasterIndex\n" + "\n".join(items)
+
+    def combined_affine_transform(self) -> Affine:
+        index = next(iter(self._wrapped_indexes.values()))
+        if len(self._wrapped_indexes) > 1:
+            return index.axis_transform.affine
+        else:
+            return index.affine
+
+    @property
+    def bbox(self) -> BoundingBox:
+        return BoundingBox.from_transform(
+            shape=tuple(self._shape[k] for k in ("y", "x")),
+            transform=self.combined_affine_transform() * Affine.translation(-0.5, -0.5),
+            crs=None,
+        )
+
+    @classmethod
+    def concat(
+        cls,
+        indexes: Sequence[Self],
+        dim: Hashable,
+        positions: Iterable[Iterable[int]] | None = None,
+    ) -> Self:
+        if len(indexes) == 1:
+            return next(iter(indexes))
+        raise NotImplementedError
+
+    def join(self, other, how) -> "RasterIndex":
+        if not isinstance(other, RasterIndex):
+            raise ValueError(
+                f"Alignment is only supported between RasterIndexes. Received RasterIndex and {type(other)!r} instead"
+            )
+
+        if set(self._wrapped_indexes.keys()) != set(other._wrapped_indexes.keys()):
+            # TODO: better error message
+            raise ValueError(
+                "Alignment is only supported between RasterIndexes, when both contain compatible transforms."
+            )
+
+        ours, theirs = as_compatible_bboxes(self, other)
+
+        if how == "outer":
+            new_bbox = bbox_union([ours, theirs])
+            print(new_bbox, ours, theirs)
+        elif how == "inner":
+            new_bbox = bbox_intersection([ours, theirs])
+
+        affine = self.combined_affine_transform()
+        new_affine, Nx, Ny = bbox_to_affine(new_bbox, rx=affine.a, ry=affine.e)
+
+        # TODO: set xdim, ydim explicitly
+        new_index = self.from_transform(new_affine, width=Nx, height=Ny)
+        assert new_index.bbox == new_bbox
+        return new_index
+
+    def reindex_like(self, other: Self, method=None, tolerance=None) -> dict[Hashable, Any]:
+        affine = self.combined_affine_transform()
+        ours, theirs = as_compatible_bboxes(self, other)
+        inter = bbox_intersection([ours, theirs])
+        dx = affine.a
+        dy = affine.e
+
+        # Fraction of a pixel that can be ignored, defaults to 1/100. Bounding box of the output
+        # geobox is allowed to be smaller than supplied bounding box by that amount.
+        # FIXME: translate user-provided `tolerance` to `tol`
+        tol: float = 0.01
+
+        indexers = {}
+        indexers["x"] = get_indexer(
+            theirs.left, ours.left, inter.left, inter.right, spacing=dx, tol=tol, size=other._shape["x"]
+        )
+        indexers["y"] = get_indexer(
+            theirs.top, ours.top, inter.top, inter.bottom, spacing=dy, tol=tol, size=other._shape["y"]
+        )
+        import ipdb
+
+        ipdb.set_trace()
+        return indexers
+
+
+def get_indexer(off, our_off, start, stop, spacing, tol, size) -> np.ndarray:
+    from math import ceil
+
+    from odc.geo.math import maybe_int
+
+    istart = ceil(maybe_int((start - off) / spacing, tol))
+
+    ours_istart = ceil(maybe_int((start - our_off) / spacing, tol))
+    ours_istop = ceil(maybe_int((stop - our_off) / spacing, tol))
+
+    idxr = np.concatenate(
+        [
+            np.full((istart,), fill_value=-1),
+            np.arange(ours_istart, ours_istop),
+            np.full((size - istart - (ours_istop - ours_istart),), fill_value=-1),
+        ]
+    )
+    return idxr
+
+
+def bbox_to_affine(bbox: BoundingBox, rx, ry) -> Affine:
+    # Fraction of a pixel that can be ignored, defaults to 1/100. Bounding box of the output
+    # geobox is allowed to be smaller than supplied bounding box by that amount.
+    # FIXME: translate user-provided `tolerance` to `tol`
+    tol: float = 0.01
+
+    from odc.geo.math import snap_grid
+
+    offx, nx = snap_grid(bbox.left, bbox.right, rx, 0, tol=tol)
+    offy, ny = snap_grid(bbox.bottom, bbox.top, ry, 0, tol=tol)
+
+    affine = Affine.translation(offx, offy) * Affine.scale(rx, ry)
+
+    return affine, nx, ny
+
+
+def as_compatible_bboxes(r1: RasterIndex, r2: RasterIndex) -> tuple[BoundingBox, BoundingBox]:
+    r1_transform = r1.combined_affine_transform()
+    r2_transform = r2.combined_affine_transform()
+    _assert_transforms_are_compatible(r1_transform, r2_transform)
+
+    return r1.bbox, r2.bbox
