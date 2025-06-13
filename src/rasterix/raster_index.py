@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import textwrap
 from collections.abc import Hashable, Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import numpy as np
 import pandas as pd
+import xproj
 from affine import Affine
-from xarray import Coordinates, DataArray, Dataset, Index, Variable
+from pyproj import CRS
+from xarray import Coordinates, DataArray, Dataset, Index, Variable, get_options
 from xarray.core.coordinate_transform import CoordinateTransform
 
 # TODO: import from public API once it is available
 from xarray.core.indexes import CoordinateTransformIndex, PandasIndex
 from xarray.core.indexing import IndexSelResult, merge_sel_results
+from xarray.core.types import JoinOptions
+from xproj.typing import CRSAwareIndex
 
 from rasterix.rioxarray_compat import guess_dims
 
@@ -76,10 +80,14 @@ class AffineTransform(CoordinateTransform):
 
         return results
 
-    def equals(self, other):
+    def equals(self, other: CoordinateTransform, exclude: frozenset[Hashable] | None = None) -> bool:
         if not isinstance(other, AffineTransform):
             return False
         return self.affine == other.affine and self.dim_size == other.dim_size
+
+    def __repr__(self) -> str:
+        params = ", ".join(f"{pn}={getattr(self.affine, pn):.4g}" for pn in "abcdef")
+        return f"{type(self).__name__}({params})"
 
 
 class AxisAffineTransform(CoordinateTransform):
@@ -129,7 +137,7 @@ class AxisAffineTransform(CoordinateTransform):
 
         return {self.dim: positions}
 
-    def equals(self, other):
+    def equals(self, other: CoordinateTransform, exclude: frozenset[Hashable] | None = None) -> bool:
         if not isinstance(other, AxisAffineTransform):
             return False
 
@@ -169,6 +177,10 @@ class AxisAffineTransform(CoordinateTransform):
             is_xaxis=self.is_xaxis,
             dtype=self.dtype,
         )
+
+    def __repr__(self) -> str:
+        params = ", ".join(f"{pn}={getattr(self.affine, pn):.4g}" for pn in "abcdef")
+        return f"{type(self).__name__}({params}, axis={'X' if self.is_xaxis else 'Y'}, dim={self.dim!r})"
 
 
 class AxisAffineTransformIndex(CoordinateTransformIndex):
@@ -284,7 +296,7 @@ def _filter_dim_indexers(index: WrappedIndex, indexers: Mapping) -> Mapping:
     return {dim: indexers[dim] for dim in dims if dim in indexers}
 
 
-class RasterIndex(Index):
+class RasterIndex(Index, xproj.ProjIndexMixin):
     """Xarray index for raster coordinates.
 
     RasterIndex is itself a wrapper around one or more Xarray indexes associated
@@ -295,17 +307,22 @@ class RasterIndex(Index):
       encapsulates a single `CoordinateTransformIndex` object for both the x and
       y axis (2-dimensional) coordinates.
 
-    - The affine transformation is rectilinear ands has no rotation: this index
+    - The affine transformation is rectilinear and has no rotation: this index
       encapsulates one or two index objects for either the x or y axis or both
       (1-dimensional) coordinates. The index type is either a subclass of
       `CoordinateTransformIndex` that supports slicing or `PandasIndex` (e.g.,
       after data selection at arbitrary locations).
 
+    RasterIndex is CRS-aware, i.e., it has a ``crs`` property that is used for
+    checking equality or compatibility with other RasterIndex instances. CRS is
+    optional.
+
     """
 
     _wrapped_indexes: dict[WrappedIndexCoords, WrappedIndex]
+    _crs: CRS | None
 
-    def __init__(self, indexes: Mapping[WrappedIndexCoords, WrappedIndex]):
+    def __init__(self, indexes: Mapping[WrappedIndexCoords, WrappedIndex], crs: CRS | Any | None = None):
         idx_keys = list(indexes)
         idx_vals = list(indexes.values())
 
@@ -322,9 +339,20 @@ class RasterIndex(Index):
 
         self._wrapped_indexes = dict(indexes)
 
+        if crs is not None:
+            crs = CRS.from_user_input(crs)
+
+        self._crs = crs
+
     @classmethod
     def from_transform(
-        cls, affine: Affine, width: int, height: int, x_dim: str = "x", y_dim: str = "y"
+        cls,
+        affine: Affine,
+        width: int,
+        height: int,
+        x_dim: str = "x",
+        y_dim: str = "y",
+        crs: CRS | Any | None = None,
     ) -> RasterIndex:
         indexes: dict[WrappedIndexCoords, AxisAffineTransformIndex | CoordinateTransformIndex]
 
@@ -342,7 +370,7 @@ class RasterIndex(Index):
             xy_transform = AffineTransform(affine, width, height, x_dim=x_dim, y_dim=y_dim)
             indexes = {("x", "y"): CoordinateTransformIndex(xy_transform)}
 
-        return cls(indexes)
+        return cls(indexes, crs=crs)
 
     @classmethod
     def from_variables(
@@ -362,25 +390,35 @@ class RasterIndex(Index):
 
         return new_variables
 
+    @property
+    def crs(self) -> CRS | None:
+        """Returns the coordinate reference system (CRS) of the index as a
+        :class:`pyproj.crs.CRS` object, or ``None`` if CRS is undefined.
+        """
+        return self._crs
+
+    def _proj_set_crs(self: RasterIndex, spatial_ref: Hashable, crs: CRS) -> RasterIndex:
+        # Returns a raster index shallow copy with a replaced CRS
+        # (XProj integration via xproj.ProjIndexMixin)
+        # Note: XProj already handles the case of overriding any existing CRS
+        return RasterIndex(self._wrapped_indexes, crs=crs)
+
     def isel(self, indexers: Mapping[Any, int | slice | np.ndarray | Variable]) -> RasterIndex | None:
         new_indexes: dict[WrappedIndexCoords, WrappedIndex] = {}
 
         for coord_names, index in self._wrapped_indexes.items():
             index_indexers = _filter_dim_indexers(index, indexers)
             if not index_indexers:
-                # no selection to perform: simply propagate the index
-                # TODO: uncomment when https://github.com/pydata/xarray/issues/10063 is fixed
-                # new_indexes[coord_names] = index
-                ...
+                new_indexes[coord_names] = index
             else:
                 new_index = index.isel(index_indexers)
                 if new_index is not None:
-                    new_indexes[coord_names] = new_index
+                    new_indexes[coord_names] = cast(WrappedIndex, new_index)
 
         if new_indexes:
             # TODO: if there's only a single PandasIndex can we just return it?
             # (maybe better to keep it wrapped if we plan to later make RasterIndex CRS-aware)
-            return RasterIndex(new_indexes)
+            return RasterIndex(new_indexes, crs=self.crs)
         else:
             return None
 
@@ -399,12 +437,24 @@ class RasterIndex(Index):
     def equals(self, other: Index) -> bool:
         if not isinstance(other, RasterIndex):
             return False
+        if not self._proj_crs_equals(cast(CRSAwareIndex, other), allow_none=True):
+            return False
         if set(self._wrapped_indexes) != set(other._wrapped_indexes):
             return False
 
         return all(
             index.equals(other._wrapped_indexes[k])  # type: ignore[arg-type]
             for k, index in self._wrapped_indexes.items()
+        )
+
+    def join(self, other: RasterIndex, how: JoinOptions = "inner") -> RasterIndex:
+        if not self._proj_crs_equals(cast(CRSAwareIndex, other), allow_none=True):
+            raise ValueError(
+                "raster indexes on objects to align do not have the same CRS\n"
+                f"first index:\n{self!r}\n\nsecond index:\n{other!r}"
+            )
+        raise NotImplementedError(
+            f"RasterIndex doesn't support alignment with inner/outer join method yet\n{self!r}"
         )
 
     def to_pandas_index(self) -> pd.Index:
@@ -418,13 +468,27 @@ class RasterIndex(Index):
 
         raise ValueError("Cannot convert RasterIndex to pandas.Index")
 
-    def __repr__(self):
+    def _repr_inline_(self, max_width: int) -> str:
+        # TODO: remove when fixed in Xarray (https://github.com/pydata/xarray/pull/10415)
+        if max_width is None:
+            max_width = get_options()["display_width"]
+
+        srs = xproj.format_crs(self.crs, max_width=max_width)
+        return f"{self.__class__.__name__} (crs={srs})"
+
+    def __repr__(self) -> str:
+        srs = xproj.format_crs(self.crs)
         items: list[str] = []
 
         for coord_names, index in self._wrapped_indexes.items():
-            items += [repr(coord_names) + ":", textwrap.indent(repr(index), "    ")]
+            # TODO: remove when CoordinateTransformIndex.__repr__ is implemented in Xarray
+            if isinstance(index, CoordinateTransformIndex):
+                index_repr = f"{type(index).__name__}({index.transform!r})"
+            else:
+                index_repr = repr(index)
+            items += [repr(coord_names) + ":", textwrap.indent(index_repr, "    ")]
 
-        return "RasterIndex\n" + "\n".join(items)
+        return f"RasterIndex(crs={srs})\n" + "\n".join(items)
 
     def transform(self) -> Affine:
         """Returns Affine transform for top-left corners."""
