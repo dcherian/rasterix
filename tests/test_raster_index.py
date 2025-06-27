@@ -59,9 +59,25 @@ def test_sel_slice():
 def test_crs() -> None:
     index = RasterIndex.from_transform(Affine.identity(), 12, 10)
     assert index.crs is None
+    variables = index.create_variables()
+    assert variables["x"].attrs == {}
+    assert variables["y"].attrs == {}
 
     index = RasterIndex.from_transform(Affine.identity(), 12, 10, crs="epsg:31370")
     assert index.crs == pyproj.CRS.from_user_input("epsg:31370")
+    variables = index.create_variables()
+    assert variables["x"].attrs == {
+        "axis": "X",
+        "long_name": "Easting",
+        "standard_name": "projection_x_coordinate",
+        "units": "metre",
+    }
+    assert variables["y"].attrs == {
+        "axis": "Y",
+        "long_name": "Northing",
+        "standard_name": "projection_y_coordinate",
+        "units": "metre",
+    }
 
 
 # asserting (in)equality for both "x" and "y" is redundant but not harmful

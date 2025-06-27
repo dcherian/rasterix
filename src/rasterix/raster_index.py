@@ -517,6 +517,11 @@ class RasterIndex(Index, xproj.ProjIndexMixin):
         for index in self._wrapped_indexes.values():
             new_variables.update(index.create_variables())
 
+        if self.crs is not None:
+            xattrs, yattrs = self.crs.cs_to_cf()
+            new_variables["x"].attrs = xattrs
+            new_variables["y"].attrs = yattrs
+
         return new_variables
 
     @property
